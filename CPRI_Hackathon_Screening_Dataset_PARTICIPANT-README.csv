@@ -1,0 +1,11 @@
+CPRI State-Level Hackathon – Screening Round Dataset,
+,
+Item,Details
+Training records,1000
+Test records,350
+Input variables,8
+Hidden outputs,Reference_Parameter + Validity_Label
+Data quality,"Noise, missing values, sensor faults, duplicate measurement pairs"
+Special feature,Genuine operating-regime change is embedded in valid data
+Submission,"Test_ID, Predicted_Reference_Parameter, Validity_Label"
+Note,Not every sensor is useful; solution should be reproducible
