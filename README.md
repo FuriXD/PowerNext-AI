@@ -1,16 +1,46 @@
-# PowerNext-AI
-Harness the power of AI to solve real-world challenges in India’s power sector.
+# Industrial data-quality and prediction pipeline
 
-## Task 01 - Identify Abnormal Records
+This pipeline treats the supplied task as three linked but separate problems:
 
-This repository now includes `identify_abnormal_records` in
-`/home/runner/work/PowerNext-AI/PowerNext-AI/abnormal_records.py`.
+1. predict a continuous/categorical **reference parameter**;
+2. predict the **Valid/Invalid** label; and
+3. diagnose unusual records as a physical/sensor fault, corrupted record, or a coherent new operating regime.
 
-The classifier marks records as:
-- `sensor_error` (impossible values, non-finite values, isolated spikes)
-- `corrupted_data` (malformed records, invalid/missing fields, bad timestamp order)
-- `invalid_test_condition` (explicitly invalid test context)
+It applies explainable engineering checks before statistical models. A record that is rare but coherent across its sensors is retained and marked `genuine_new_regime`; a record that violates range, cross-sensor, frozen-sensor, or rate-of-change constraints is marked erroneous.
 
-It also distinguishes a **genuine operating behavior shift** from an isolated
-measurement error by checking whether large deviations persist across a
-consecutive window.
+## Run
+
+```bash
+python industrial_pipeline.py \
+  --train data/train.csv --test data/test.csv --out results
+```
+
+The script detects target columns named `Reference Parameter`/`reference_parameter` and `Valid/Invalid`/`valid_invalid`, with a case-insensitive match. Override unusual names explicitly:
+
+```bash
+python industrial_pipeline.py --train train.csv --test test.csv --out results \
+  --reference-column RefParam --validity-column QA_Status --time-column cycle
+```
+
+Output:
+
+- `results/scored_test.csv` — predictions, anomaly scores, and one auditable primary reason per row.
+- `results/summary.json` — counts by reason, model metadata, and aggregate quality statistics.
+- `results/rule_config.json` — learned bounds/tolerances used for the run.
+
+## Rule configuration
+
+By default, numerical hardware envelopes use robust training-data limits (0.1–99.9 percentiles with a 10% margin), which makes the starter pipeline usable without equipment specifications. For production, pass a JSON file of approved physical limits and tolerances:
+
+```json
+{
+  "ranges": {"Temperature": [-40, 180], "Current": [0, 500]},
+  "sensor_groups": [["S1", "S2", "S3"]],
+  "max_rate": {"Temperature": 5.0},
+  "frozen_window": 5
+}
+```
+
+Use `--rules rules.json`. Rate checks are only applied when `--time-column` is provided; input must be ordered within each asset (or use `--asset-column`).
+
+The PCA reconstruction score is the lightweight surrogate/twin layer: it learns normal sensor relationships from valid training rows. The isolation forest and robust Mahalanobis score provide complementary multivariate anomaly signals. Coherent anomalies are assigned to a Gaussian-mixture operating regime; inconsistent anomalies remain erroneous.
