@@ -1,0 +1,36 @@
+{
+  "rows": 350,
+  "diagnosis_counts": {
+    "normal": 293,
+    "sensor_error": 34,
+    "corrupted_record": 17,
+    "invalid_condition": 1,
+    "genuine_new_regime": 5
+  },
+  "predicted_validity_counts": {
+    "Valid": 333,
+    "Invalid": 17
+  },
+  "features": [
+    "Applied_Voltage_kV",
+    "Load_Current_A",
+    "Ambient_Temperature_C",
+    "Test_Duration_min",
+    "Sensor_S1",
+    "Sensor_S2",
+    "Sensor_S3",
+    "Sensor_S4"
+  ],
+  "reference_column": "Reference_Parameter",
+  "validity_column": "Validity_Label",
+  "models": {
+    "reference": "ExtraTreesRegressor",
+    "validity": "ExtraTreesClassifier",
+    "anomaly": [
+      "IsolationForest",
+      "PCA surrogate reconstruction",
+      "robust Mahalanobis",
+      "GaussianMixture"
+    ]
+  }
+}

@@ -12,12 +12,13 @@ from sklearn.decomposition import PCA
 from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor, IsolationForest
 from sklearn.impute import SimpleImputer
 from sklearn.mixture import GaussianMixture
+from sklearn.model_selection import KFold, cross_val_predict
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 RANDOM_STATE = 41
 REFERENCE_ALIASES = ("reference parameter", "reference_parameter", "reference", "target")
-VALIDITY_ALIASES = ("valid/invalid", "valid_invalid", "validity", "is_valid", "valid")
+VALIDITY_ALIASES = ("valid/invalid", "valid_invalid", "validity", "validity_label", "is_valid", "valid")
 
 
 def normalise(name: str) -> str:
@@ -105,6 +106,46 @@ def valid_mask(y: pd.Series) -> pd.Series:
     return y.astype(str).str.strip().str.lower().isin(("valid", "1", "true", "yes", "y"))
 
 
+def sensor_twin_checks(train: pd.DataFrame, test: pd.DataFrame, is_valid: pd.Series, features: list[str]) -> pd.DataFrame:
+    """Flag isolated departures from a normal, operating-condition sensor twin.
+
+    Only channels whose valid-record out-of-fold R² is at least 0.50 are used:
+    an unpredictable/noisy channel cannot provide reliable fault evidence.
+    """
+    sensor_cols = [c for c in features if normalise(c).startswith(("sensor", "s_"))]
+    operating_cols = [c for c in features if c not in sensor_cols]
+    result = pd.DataFrame(index=test.index)
+    result["sensor_fault_channels"] = ""
+    result["rule_sensor_residual"] = False
+    if not sensor_cols or not operating_cols:
+        return result
+    channel_flags: dict[str, pd.Series] = {}
+    for sensor in sensor_cols:
+        fit_rows = is_valid & train[sensor].notna()
+        if fit_rows.sum() < 25:
+            continue
+        model = ExtraTreesRegressor(n_estimators=300, min_samples_leaf=3, random_state=RANDOM_STATE, n_jobs=-1)
+        folds = KFold(n_splits=min(5, int(fit_rows.sum())), shuffle=True, random_state=RANDOM_STATE)
+        x_fit, y_fit = train.loc[fit_rows, operating_cols], train.loc[fit_rows, sensor]
+        oof = cross_val_predict(model, x_fit, y_fit, cv=folds, n_jobs=-1)
+        residual = y_fit.to_numpy() - oof
+        baseline = np.sum((y_fit.to_numpy() - y_fit.mean()) ** 2)
+        r2 = 1 - np.sum(residual ** 2) / baseline if baseline else 0.0
+        if r2 < 0.50:
+            continue
+        scale = max(np.median(np.abs(residual - np.median(residual))) * 1.4826, 1e-6)
+        threshold = float(np.quantile(np.abs(residual - np.median(residual)) / scale, .99))
+        model.fit(x_fit, y_fit)
+        z = np.abs(test[sensor] - model.predict(test[operating_cols])) / scale
+        result[f"twin_residual_{sensor}"] = z
+        channel_flags[sensor] = z.gt(threshold).fillna(False)
+    if channel_flags:
+        flags = pd.DataFrame(channel_flags)
+        result["rule_sensor_residual"] = flags.any(axis=1)
+        result["sensor_fault_channels"] = flags.apply(lambda row: ",".join(row.index[row].tolist()), axis=1)
+    return result
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--train", required=True); ap.add_argument("--test", required=True); ap.add_argument("--out", required=True)
@@ -118,6 +159,7 @@ def main() -> None:
     rules = load_rules(args.rules, train, features)
     test_rules = engineering_rules(test[features + [x for x in (args.time_column, args.asset_column) if x]], rules, args.time_column, args.asset_column)
     normal_train = valid_mask(train[validity])
+    twin_checks = sensor_twin_checks(train, test, normal_train, features)
     x_normal = x_train[normal_train.to_numpy()] if normal_train.sum() >= 10 else x_train
     iso = IsolationForest(contamination="auto", random_state=RANDOM_STATE).fit(x_normal)
     iso_score = -iso.score_samples(x_test)
@@ -141,6 +183,10 @@ def main() -> None:
     # record is an invalid operating condition, not evidence of a sensor failure.
     reasons = np.where(statistical, "genuine_new_regime", "normal").astype(object)
     reasons[~valid_mask(pd.Series(valid_prediction)).to_numpy()] = "invalid_condition"
+    # A local residual in an otherwise physically plausible record is a measurement
+    # fault. It takes precedence over the learned invalid label because it supplies
+    # the root cause, not merely its downstream classification.
+    reasons[twin_checks["rule_sensor_residual"].to_numpy()] = "sensor_error"
     reasons[rule_bad] = "sensor_error"
     reasons[test_rules["rule_missing"].to_numpy()] = "corrupted_record"
     target = train[ref]
@@ -155,6 +201,7 @@ def main() -> None:
     out["operating_regime"] = regime
     out["isolation_score"] = iso_score; out["twin_reconstruction_error"] = reconstruction; out["robust_mahalanobis"] = mahal
     for c in test_rules: out[c] = test_rules[c].to_numpy()
+    for c in twin_checks: out[c] = twin_checks[c].to_numpy()
     out_dir = Path(args.out); out_dir.mkdir(parents=True, exist_ok=True)
     out.to_csv(out_dir / "scored_test.csv", index=False)
     (out_dir / "rule_config.json").write_text(json.dumps(rules, indent=2))

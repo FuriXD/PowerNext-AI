@@ -1,0 +1,49 @@
+{
+  "ranges": {
+    "Applied_Voltage_kV": [
+      5.68541231,
+      34.36333139
+    ],
+    "Load_Current_A": [
+      5.612730600000003,
+      119.41809899999998
+    ],
+    "Ambient_Temperature_C": [
+      14.3,
+      58.7
+    ],
+    "Test_Duration_min": [
+      -0.38983992999999906,
+      65.28256522999999
+    ],
+    "Sensor_S1": [
+      -2.3694222099999824,
+      27.5150131099998
+    ],
+    "Sensor_S2": [
+      -2.679338110000006,
+      29.465465210000062
+    ],
+    "Sensor_S3": [
+      -1.923314480000022,
+      33.06045928000024
+    ],
+    "Sensor_S4": [
+      4.827714800000008,
+      92.67204919999993
+    ]
+  },
+  "sensor_groups": [
+    [
+      "Sensor_S1",
+      "Sensor_S2",
+      "Sensor_S3",
+      "Sensor_S4"
+    ]
+  ],
+  "cross_sensor_tolerance": {
+    "Sensor_S1|Sensor_S2|Sensor_S3|Sensor_S4": 87.52758720999992
+  },
+  "max_rate": {},
+  "frozen_window": 5
+}

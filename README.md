@@ -43,4 +43,4 @@ By default, numerical hardware envelopes use robust training-data limits (0.1–
 
 Use `--rules rules.json`. Rate checks are only applied when `--time-column` is provided; input must be ordered within each asset (or use `--asset-column`).
 
-The PCA reconstruction score is the lightweight surrogate/twin layer: it learns normal sensor relationships from valid training rows. The isolation forest and robust Mahalanobis score provide complementary multivariate anomaly signals. Coherent anomalies are assigned to a Gaussian-mixture operating regime; inconsistent anomalies remain erroneous.
+The sensor-twin layer trains one surrogate per informative sensor on valid records only, using the operating inputs. A localized, high residual is logged as `sensor_error` and identifies the affected channel. It deliberately ignores sensors whose valid-record relationship is too noisy to be reliable. PCA reconstruction, Isolation Forest, and robust Mahalanobis provide complementary multivariate anomaly signals. A rare record is classified as `genuine_new_regime` only when it has no rule violation, no localized sensor residual, and a valid predicted condition.
