@@ -1,64 +1,99 @@
-operating states.
+# PowerNext AI
 
-### 4. Preserve duplicate evidence
+**Industrial test-data quality, validity classification, and calibrated reference-parameter prediction.**
 
-Historical exact duplicates are all Invalid and can carry inconsistent
-reference values.  Duplicate test records are therefore marked as corrupted
-and assigned `Invalid`, while retaining their model reference estimate for a
-complete audit trail.
+PowerNext AI processes electrical-system laboratory test data where automated
+measurements may be noisy, incomplete, duplicated, or unreliable.  Given
+historical tests with calibrated reference values and Valid/Invalid labels, it
+learns the normal operating behaviour and produces an upload-ready prediction
+file for new tests.
 
-## Decision hierarchy
+The project is designed around a practical laboratory principle: **an unusual
+test is not necessarily a bad test**.  It separates coherent changes in
+operating behaviour from corrupted records and isolated sensor faults.
 
-```text
-Missing or duplicate data
-        ↓
-Engineering-rule or sensor-twin violation
-        ↓
-Predicted invalid test condition
-        ↓
-Rare but coherent operating regime
-        ↓
-Normal record
+## What it produces
+
+For each new test record, the pipeline produces:
+
+- `Predicted_Reference_Parameter` — estimated calibrated reference value.
+- `Validity_Label` — `Valid` or `Invalid` classification.
+- A detailed audit record with anomaly scores, engineering-rule flags,
+  duplicate evidence, and identified sensor-fault channels.
+
+The submission file exactly follows the schema and ID ordering in `Sample.csv`.
+
+## Quick start
+
+### Requirements
+
+- Python 3.10 or later
+- `pandas`, `numpy`, and `scikit-learn`
+
+Install dependencies:
+
+```bash
+python3 -m pip install -r requirements.txt
 ```
 
-This hierarchy records the most actionable root cause when several indicators
-are present.
+Run the pipeline on the supplied data:
 
-## Validation results
+```bash
+python3 industrial_pipeline.py \
+  --train training_data.csv \
+  --test test_data.csv \
+  --out output \
+  --submission-template Sample.csv
+```
 
-All metrics below are calculated with five-fold out-of-fold validation on the
-supplied historical data.
+The final upload file is written to:
 
-| Measure | Result |
-| --- | ---: |
-| Reference prediction MAE | 0.9370 |
-| Reference prediction RMSE | 2.3521 |
-| Reference prediction R² | 0.9516 |
-| Invalid-class F1 | 0.9249 |
-| Invalid-class balanced accuracy | 0.9354 |
+```text
+output/submission.csv
+```
 
-The program verifies the generated submission before writing it: schema,
-column order, row count, test-ID order, missing predictions, numeric reference
-values, and permitted validity labels are all checked.
+## Input data
 
-## Current supplied-test run
+| File | Purpose |
+| --- | --- |
+| `training_data.csv` | Historical measurements with `Reference_Parameter` and `Validity_Label`. |
+| `test_data.csv` | New test records to score. |
+| `Sample.csv` | Required submission schema and test-ID order. |
 
-The included `summary.json` records the latest run on the supplied 350-row test
-set:
+The supplied dataset contains eight numerical measurement columns: applied
+voltage, load current, ambient temperature, test duration, and four sensor
+channels.  The program detects the target columns by name; command-line
+overrides are available for different schemas.
 
-| Finding | Records |
-| --- | ---: |
-| Normal | 286 |
-| Sensor error | 34 |
-| Corrupted record | 23 |
-| Invalid condition | 2 |
-| Genuine new regime | 5 |
-| Exact duplicate records | 8 |
+## How it works
 
-The generated submission contains 303 `Valid` and 47 `Invalid` predictions.
+### 1. Learn normal equipment behaviour
 
-## Output files
+An ExtraTrees regressor learns the relationship between operating conditions,
+sensor readings, and the calibrated `Reference_Parameter` from historical
+tests.
 
+### 2. Identify unreliable data
+
+The pipeline combines several independent checks:
+
+- robust operating-range and cross-sensor consistency rules;
+- missing-value, rate-of-change, and frozen-sensor checks;
+- **sensor twins**, which estimate each reliable sensor from operating inputs
+  and flag isolated departures;
+- exact duplicate-record detection, independent of `Test_ID`;
+- multivariate novelty checks using Isolation Forest, PCA reconstruction error,
+  and robust Mahalanobis distance.
+
+### 3. Predict validity without mistaking novelty for failure
+
+An ExtraTrees classifier uses raw measurements and sensor-consistency features
+to predict `Valid`/`Invalid`.  Its Invalid threshold is selected from
+stratified out-of-fold predictions to focus on the minority Invalid class.
+
+A rare record is retained as `genuine_new_regime` only when it is internally
+coherent: it must pass engineering checks, show no localized sensor fault, and
+be predicted Valid.  This prevents automatic rejection of meaningful new
 | File | Description |
 | --- | --- |
 | `output/submission.csv` | Upload-ready prediction file matching `Sample.csv`. |
