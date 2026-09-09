@@ -20,6 +20,7 @@ from sklearn.preprocessing import StandardScaler
 RANDOM_STATE = 41
 REFERENCE_ALIASES = ("reference parameter", "reference_parameter", "reference", "target")
 VALIDITY_ALIASES = ("valid/invalid", "valid_invalid", "validity", "validity_label", "is_valid", "valid")
+SUBMISSION_COLUMNS = ("Test_ID", "Predicted_Reference_Parameter", "Validity_Label")
 
 
 def normalise(name: str) -> str:
@@ -158,6 +159,38 @@ def baseline_metrics(train: pd.DataFrame, features: list[str], reference_column:
     }
 
 
+def export_submission(scored: pd.DataFrame, sample_path: Path, destination: Path) -> None:
+    """Write and verify the three-column submission required by the sample template."""
+    template = pd.read_csv(sample_path)
+    if list(template.columns) != list(SUBMISSION_COLUMNS):
+        raise ValueError(f"Submission template must have columns {list(SUBMISSION_COLUMNS)}.")
+    if scored["Test_ID"].duplicated().any():
+        raise ValueError("Cannot export submission: scored output contains duplicate Test_ID values.")
+    if set(template["Test_ID"]) != set(scored["Test_ID"]):
+        raise ValueError("Cannot export submission: Sample.csv and scored output Test_ID values differ.")
+
+    ordered = scored.set_index("Test_ID").loc[template["Test_ID"]]
+    submission = pd.DataFrame({
+        "Test_ID": template["Test_ID"].to_numpy(),
+        "Predicted_Reference_Parameter": pd.to_numeric(ordered["predicted_reference_parameter"], errors="raise").to_numpy(),
+        "Validity_Label": np.where(valid_mask(ordered["predicted_validity"]), "Valid", "Invalid"),
+    })
+    submission.to_csv(destination, index=False)
+
+    written = pd.read_csv(destination)
+    checks = {
+        "column names and order match Sample.csv": list(written.columns) == list(template.columns),
+        "Test_ID values and order match Sample.csv": written["Test_ID"].equals(template["Test_ID"]),
+        "output columns contain no missing values": not written[["Predicted_Reference_Parameter", "Validity_Label"]].isna().any().any(),
+        "Predicted_Reference_Parameter is numeric": pd.api.types.is_numeric_dtype(written["Predicted_Reference_Parameter"]),
+        "Validity_Label values are Valid/Invalid": written["Validity_Label"].isin(["Valid", "Invalid"]).all(),
+    }
+    for name, passed in checks.items():
+        print(f"{'PASS' if passed else 'FAIL'}: {name}")
+    if not all(checks.values()):
+        raise ValueError("Submission verification failed.")
+
+
 def sensor_twin_checks(train: pd.DataFrame, test: pd.DataFrame, is_valid: pd.Series, features: list[str]) -> pd.DataFrame:
     """Flag isolated departures from a normal, operating-condition sensor twin.
 
@@ -202,6 +235,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--train", required=True); ap.add_argument("--test", required=True); ap.add_argument("--out", required=True)
     ap.add_argument("--reference-column"); ap.add_argument("--validity-column"); ap.add_argument("--time-column"); ap.add_argument("--asset-column"); ap.add_argument("--rules")
+    ap.add_argument("--export-submission", action="store_true", help="write a verified submission.csv using Sample.csv next to --test")
     args = ap.parse_args()
     train, test = pd.read_csv(args.train), pd.read_csv(args.test)
     ref = resolve_column(train, args.reference_column, REFERENCE_ALIASES, "reference")
@@ -256,6 +290,8 @@ def main() -> None:
     for c in twin_checks: out[c] = twin_checks[c].to_numpy()
     out_dir = Path(args.out); out_dir.mkdir(parents=True, exist_ok=True)
     out.to_csv(out_dir / "scored_test.csv", index=False)
+    if args.export_submission:
+        export_submission(out, Path(args.test).with_name("Sample.csv"), out_dir / "submission.csv")
     (out_dir / "metrics_baseline.json").write_text(json.dumps(baseline_metrics(train, features, ref, validity), indent=2))
     (out_dir / "rule_config.json").write_text(json.dumps(rules, indent=2))
     diagnosis_counts = {key: int((out["diagnosis"] == key).sum()) for key in ("normal", "sensor_error", "corrupted_record", "invalid_condition", "genuine_new_regime")}
