@@ -12,7 +12,8 @@ from sklearn.decomposition import PCA
 from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor, IsolationForest
 from sklearn.impute import SimpleImputer
 from sklearn.mixture import GaussianMixture
-from sklearn.model_selection import KFold, cross_val_predict
+from sklearn.metrics import f1_score, mean_absolute_error, mean_squared_error, precision_score, r2_score, recall_score, roc_auc_score
+from sklearn.model_selection import KFold, StratifiedKFold, cross_val_predict
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -104,6 +105,57 @@ def build_feature_matrix(train: pd.DataFrame, test: pd.DataFrame, excluded: list
 
 def valid_mask(y: pd.Series) -> pd.Series:
     return y.astype(str).str.strip().str.lower().isin(("valid", "1", "true", "yes", "y"))
+
+
+def baseline_metrics(train: pd.DataFrame, features: list[str], reference_column: str, validity_column: str) -> dict[str, Any]:
+    """Measure the current supervised model configurations with out-of-fold predictions."""
+    n_splits = 5
+    x = train[features]
+    preprocessor = Pipeline([("impute", SimpleImputer(strategy="median")), ("scale", StandardScaler())])
+    reference_model = Pipeline([
+        ("preprocess", preprocessor),
+        ("model", ExtraTreesRegressor(n_estimators=400, min_samples_leaf=2, random_state=RANDOM_STATE, n_jobs=-1)),
+    ])
+    reference_cv = KFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
+    reference_truth = train[reference_column]
+    reference_prediction = cross_val_predict(reference_model, x, reference_truth, cv=reference_cv)
+
+    validity_truth = train[validity_column].astype(str)
+    validity_model = Pipeline([
+        ("preprocess", Pipeline([("impute", SimpleImputer(strategy="median")), ("scale", StandardScaler())])),
+        ("model", ExtraTreesClassifier(n_estimators=400, min_samples_leaf=2, class_weight="balanced", random_state=RANDOM_STATE, n_jobs=-1)),
+    ])
+    validity_cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
+    validity_probability = cross_val_predict(validity_model, x, validity_truth, cv=validity_cv, method="predict_proba")
+    classes = np.unique(validity_truth)
+    positive_indices = np.flatnonzero(valid_mask(pd.Series(classes)).to_numpy())
+    if len(positive_indices) != 1:
+        raise ValueError("Validity cross-validation requires exactly one recognized valid class.")
+    positive_index = int(positive_indices[0])
+    validity_prediction = valid_mask(pd.Series(classes[np.argmax(validity_probability, axis=1)])).to_numpy()
+    validity_binary = valid_mask(validity_truth).to_numpy()
+
+    return {
+        "random_state": RANDOM_STATE,
+        "reference": {
+            "model": "ExtraTreesRegressor",
+            "folds": n_splits,
+            "splitter": "KFold(shuffle=True)",
+            "mae": float(mean_absolute_error(reference_truth, reference_prediction)),
+            "rmse": float(np.sqrt(mean_squared_error(reference_truth, reference_prediction))),
+            "r2": float(r2_score(reference_truth, reference_prediction)),
+        },
+        "validity": {
+            "model": "ExtraTreesClassifier",
+            "folds": n_splits,
+            "splitter": "StratifiedKFold(shuffle=True)",
+            "positive_class": str(classes[positive_index]),
+            "precision": float(precision_score(validity_binary, validity_prediction, zero_division=0)),
+            "recall": float(recall_score(validity_binary, validity_prediction, zero_division=0)),
+            "f1": float(f1_score(validity_binary, validity_prediction, zero_division=0)),
+            "roc_auc": float(roc_auc_score(validity_binary, validity_probability[:, positive_index])),
+        },
+    }
 
 
 def sensor_twin_checks(train: pd.DataFrame, test: pd.DataFrame, is_valid: pd.Series, features: list[str]) -> pd.DataFrame:
@@ -204,6 +256,7 @@ def main() -> None:
     for c in twin_checks: out[c] = twin_checks[c].to_numpy()
     out_dir = Path(args.out); out_dir.mkdir(parents=True, exist_ok=True)
     out.to_csv(out_dir / "scored_test.csv", index=False)
+    (out_dir / "metrics_baseline.json").write_text(json.dumps(baseline_metrics(train, features, ref, validity), indent=2))
     (out_dir / "rule_config.json").write_text(json.dumps(rules, indent=2))
     diagnosis_counts = {key: int((out["diagnosis"] == key).sum()) for key in ("normal", "sensor_error", "corrupted_record", "invalid_condition", "genuine_new_regime")}
     summary = {"rows": int(len(out)), "diagnosis_counts": diagnosis_counts,

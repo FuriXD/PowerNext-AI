@@ -1,0 +1,21 @@
+{
+  "random_state": 41,
+  "reference": {
+    "model": "ExtraTreesRegressor",
+    "folds": 5,
+    "splitter": "KFold(shuffle=True)",
+    "mae": 0.9370193436973174,
+    "rmse": 2.352052247871499,
+    "r2": 0.9515843949917138
+  },
+  "validity": {
+    "model": "ExtraTreesClassifier",
+    "folds": 5,
+    "splitter": "StratifiedKFold(shuffle=True)",
+    "positive_class": "Valid",
+    "precision": 0.9011446409989594,
+    "recall": 1.0,
+    "f1": 0.9480021893814997,
+    "roc_auc": 0.8984695460342629
+  }
+}
