@@ -1,62 +1,103 @@
-# PowerNext AI — industrial data-quality and prediction pipeline
+operating states.
 
-This pipeline treats the supplied task as three linked but separate problems:
+### 4. Preserve duplicate evidence
 
-1. predict a continuous/categorical **reference parameter**;
-2. predict the **Valid/Invalid** label; and
-3. diagnose unusual records as a physical/sensor fault, corrupted record, or a coherent new operating regime.
+Historical exact duplicates are all Invalid and can carry inconsistent
+reference values.  Duplicate test records are therefore marked as corrupted
+and assigned `Invalid`, while retaining their model reference estimate for a
+complete audit trail.
 
-It applies explainable engineering checks before statistical models. A record that is rare but coherent across its sensors is retained and marked `genuine_new_regime`; a record that violates range, cross-sensor, frozen-sensor, or rate-of-change constraints is marked erroneous.
+## Decision hierarchy
 
-## Quick start
+```text
+Missing or duplicate data
+        ↓
+Engineering-rule or sensor-twin violation
+        ↓
+Predicted invalid test condition
+        ↓
+Rare but coherent operating regime
+        ↓
+Normal record
+```
 
-Install the small runtime dependency set, then run against the included hackathon data:
+This hierarchy records the most actionable root cause when several indicators
+are present.
+
+## Validation results
+
+All metrics below are calculated with five-fold out-of-fold validation on the
+supplied historical data.
+
+| Measure | Result |
+| --- | ---: |
+| Reference prediction MAE | 0.9370 |
+| Reference prediction RMSE | 2.3521 |
+| Reference prediction R² | 0.9516 |
+| Invalid-class F1 | 0.9249 |
+| Invalid-class balanced accuracy | 0.9354 |
+
+The program verifies the generated submission before writing it: schema,
+column order, row count, test-ID order, missing predictions, numeric reference
+values, and permitted validity labels are all checked.
+
+## Current supplied-test run
+
+The included `summary.json` records the latest run on the supplied 350-row test
+set:
+
+| Finding | Records |
+| --- | ---: |
+| Normal | 286 |
+| Sensor error | 34 |
+| Corrupted record | 23 |
+| Invalid condition | 2 |
+| Genuine new regime | 5 |
+| Exact duplicate records | 8 |
+
+The generated submission contains 303 `Valid` and 47 `Invalid` predictions.
+
+## Output files
+
+| File | Description |
+| --- | --- |
+| `output/submission.csv` | Upload-ready prediction file matching `Sample.csv`. |
+| `output/scored_test.csv` | Full diagnostic output for every test record. |
+| `output/summary.json` | Run totals, models, features, threshold, and diagnoses. |
+| `output/metrics_baseline.json` | Cross-validated model-performance metrics. |
+| `output/rule_config.json` | Learned engineering ranges and sensor tolerances. |
+
+## Optional arguments
 
 ```bash
-python3 -m pip install -r requirements.txt
-python3 industrial_pipeline.py \
-  --train training_data.csv --test test_data.csv --out pipeline_output \
-  --submission-template Sample.csv
+python3 industrial_pipeline.py --help
 ```
 
-This produces `pipeline_output/submission.csv` with exactly the same columns and order as `Sample.csv`, ready to upload, alongside the full diagnostic output.
+Useful options include:
 
-## General usage
+- `--reference-column` and `--validity-column` for custom target names;
+- `--time-column` and `--asset-column` to enable time-aware rate/frozen-sensor
+  checks;
+- `--rules rules.json` to provide approved laboratory limits and tolerances;
+- `--id-column` when the submission identifier uses a nonstandard name.
 
-```bash
-python3 industrial_pipeline.py \
-  --train data/train.csv --test data/test.csv --out results
+## Reproducibility
+
+The random state is fixed, all generated artifacts are written to the selected
+output directory, and the complete methodology is documented in
+[`methodology.md`](methodology.md).  Re-running the command above recreates the
+submission and its associated audit trail.
+
+## Project files
+
+```text
+industrial_pipeline.py   Main reproducible pipeline
+requirements.txt         Python dependencies
+methodology.md           Detailed method and validation rationale
+training_data.csv        Historical labelled tests
+test_data.csv            New tests to score
+Sample.csv               Submission template
+prediction.csv           Included submission prediction file
+summary.json             Included run summary
+output/                  Reproduced diagnostic artifacts
 ```
-
-The script detects target columns named `Reference Parameter`/`reference_parameter` and `Valid/Invalid`/`valid_invalid`, with a case-insensitive match. Override unusual names explicitly:
-
-```bash
-python3 industrial_pipeline.py --train train.csv --test test.csv --out results \
-  --reference-column RefParam --validity-column QA_Status --time-column cycle
-```
-
-Output:
-
-- `results/scored_test.csv` — predictions, anomaly scores, and one auditable primary reason per row.
-- `results/summary.json` — counts by reason, model metadata, and aggregate quality statistics.
-- `results/rule_config.json` — learned bounds/tolerances used for the run.
-- `results/submission.csv` — optional upload-ready file, created with `--submission-template`.
-
-`invalid_probability` estimates the chance that a record is Invalid. The pipeline selects an Invalid cutoff using stratified out-of-fold predictions on the training data, maximizing Invalid F1 and using balanced accuracy as a tie-breaker. This avoids the misleadingly high accuracy that can arise when Invalid records are rare. `validity_confidence` is the probability associated with the final predicted label. Neither value is an engineering safety score; use the rule flags and diagnosis for that purpose.
-
-## Rule configuration
-
-By default, numerical hardware envelopes use robust training-data limits (0.1–99.9 percentiles with a 10% margin), which makes the starter pipeline usable without equipment specifications. For production, pass a JSON file of approved physical limits and tolerances:
-
-```json
-{
-  "ranges": {"Temperature": [-40, 180], "Current": [0, 500]},
-  "sensor_groups": [["S1", "S2", "S3"]],
-  "max_rate": {"Temperature": 5.0},
-  "frozen_window": 5
-}
-```
-
-Use `--rules rules.json`. Rate checks are only applied when `--time-column` is provided; input must be ordered within each asset (or use `--asset-column`).
-
-The sensor-twin layer trains one surrogate per informative sensor on valid records only, using the operating inputs. A localized, high residual is logged as `sensor_error` and identifies the affected channel. It deliberately ignores sensors whose valid-record relationship is too noisy to be reliable. The validity classifier additionally learns sensor mean, spread, missing-count, and pairwise-difference features, which make cross-sensor inconsistency easier to detect. PCA reconstruction, Isolation Forest, and robust Mahalanobis provide complementary multivariate anomaly signals. A rare record is classified as `genuine_new_regime` only when it has no rule violation, no localized sensor residual, and a valid predicted condition.
