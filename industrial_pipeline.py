@@ -11,8 +11,8 @@ import pandas as pd
 from sklearn.decomposition import PCA
 from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor, IsolationForest
 from sklearn.impute import SimpleImputer
+from sklearn.metrics import balanced_accuracy_score, f1_score, mean_absolute_error, mean_squared_error, precision_score, r2_score, recall_score, roc_auc_score
 from sklearn.mixture import GaussianMixture
-from sklearn.metrics import f1_score, mean_absolute_error, mean_squared_error, precision_score, r2_score, recall_score, roc_auc_score
 from sklearn.model_selection import KFold, StratifiedKFold, cross_val_predict
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -21,6 +21,7 @@ RANDOM_STATE = 41
 REFERENCE_ALIASES = ("reference parameter", "reference_parameter", "reference", "target")
 VALIDITY_ALIASES = ("valid/invalid", "valid_invalid", "validity", "validity_label", "is_valid", "valid")
 SUBMISSION_COLUMNS = ("Test_ID", "Predicted_Reference_Parameter", "Validity_Label")
+ID_ALIASES = ("test_id", "id", "record_id", "sample_id")
 
 
 def normalise(name: str) -> str:
@@ -102,6 +103,22 @@ def build_feature_matrix(train: pd.DataFrame, test: pd.DataFrame, excluded: list
         raise ValueError("Need at least two shared numeric feature columns.")
     prep = Pipeline([("impute", SimpleImputer(strategy="median")), ("scale", StandardScaler())])
     return features, prep, prep.fit_transform(train[features]), prep.transform(test[features])
+
+
+def add_validity_features(frame: pd.DataFrame, features: list[str]) -> pd.DataFrame:
+    """Add sensor-consistency signals that distinguish bad records from normal variation."""
+    enriched = frame[features].copy()
+    sensors = [c for c in features if normalise(c).startswith(("sensor", "s_"))]
+    if len(sensors) < 2:
+        return enriched
+    enriched["sensor_mean"] = enriched[sensors].mean(axis=1)
+    enriched["sensor_std"] = enriched[sensors].std(axis=1)
+    enriched["sensor_range"] = enriched[sensors].max(axis=1) - enriched[sensors].min(axis=1)
+    enriched["sensor_missing_count"] = enriched[sensors].isna().sum(axis=1)
+    for left_idx, left in enumerate(sensors):
+        for right in sensors[left_idx + 1:]:
+            enriched[f"{left}_minus_{right}"] = enriched[left] - enriched[right]
+    return enriched
 
 
 def valid_mask(y: pd.Series) -> pd.Series:
@@ -189,6 +206,52 @@ def export_submission(scored: pd.DataFrame, sample_path: Path, destination: Path
         print(f"{'PASS' if passed else 'FAIL'}: {name}")
     if not all(checks.values()):
         raise ValueError("Submission verification failed.")
+def fit_validity_model(train_features: pd.DataFrame, test_features: pd.DataFrame, labels: pd.Series) -> tuple[Pipeline, np.ndarray, np.ndarray, float, dict[str, float]]:
+    """Fit a validity classifier and calibrate its Invalid cutoff with OOF predictions.
+
+    Plain accuracy hides weak Invalid detection in the imbalanced task data. The
+    cutoff is selected by out-of-fold Invalid F1, then balanced accuracy breaks
+    ties, so validation is not based on in-sample predictions.
+    """
+    labels = labels.astype(str).str.strip()
+    valid_rows = valid_mask(labels)
+    if not valid_rows.any() or valid_rows.all():
+        raise ValueError("Validity target must contain both Valid and Invalid records.")
+    valid_label = labels[valid_rows].mode().iloc[0]
+    invalid_label = labels[~valid_rows].mode().iloc[0]
+    model = Pipeline([
+        ("impute", SimpleImputer(strategy="median")),
+        ("scale", StandardScaler()),
+        ("model", ExtraTreesClassifier(
+            n_estimators=400, min_samples_leaf=2, class_weight="balanced",
+            random_state=RANDOM_STATE, n_jobs=-1,
+        )),
+    ])
+    invalid_binary = (~valid_rows).to_numpy()
+    smallest_class = int(min(invalid_binary.sum(), (~invalid_binary).sum()))
+    threshold = 0.5
+    validation: dict[str, float] = {}
+    if smallest_class >= 2:
+        folds = StratifiedKFold(n_splits=min(5, smallest_class), shuffle=True, random_state=RANDOM_STATE)
+        probabilities = cross_val_predict(model, train_features, labels, cv=folds, method="predict_proba", n_jobs=1)
+        class_order = np.unique(labels)
+        invalid_index = int(np.where(class_order == invalid_label)[0][0])
+        invalid_probability = probabilities[:, invalid_index]
+        best: tuple[float, float, float] | None = None
+        for candidate in np.arange(0.20, 0.701, 0.025):
+            predicted_invalid = invalid_probability >= candidate
+            score = (float(f1_score(invalid_binary, predicted_invalid)), float(balanced_accuracy_score(invalid_binary, predicted_invalid)), float(candidate))
+            if best is None or score[:2] > best[:2]:
+                best = score
+        assert best is not None
+        invalid_f1, balanced_accuracy, threshold = best
+        validation = {"invalid_f1_oof": round(invalid_f1, 4), "balanced_accuracy_oof": round(balanced_accuracy, 4)}
+    model.fit(train_features, labels)
+    classes = model.named_steps["model"].classes_
+    invalid_index = int(np.where(classes == invalid_label)[0][0])
+    invalid_probability = model.predict_proba(test_features)[:, invalid_index]
+    predictions = np.where(invalid_probability >= threshold, invalid_label, valid_label)
+    return model, predictions, invalid_probability, float(threshold), validation
 
 
 def sensor_twin_checks(train: pd.DataFrame, test: pd.DataFrame, is_valid: pd.Series, features: list[str]) -> pd.DataFrame:
@@ -211,7 +274,13 @@ def sensor_twin_checks(train: pd.DataFrame, test: pd.DataFrame, is_valid: pd.Ser
             continue
         model = ExtraTreesRegressor(n_estimators=300, min_samples_leaf=3, random_state=RANDOM_STATE, n_jobs=-1)
         folds = KFold(n_splits=min(5, int(fit_rows.sum())), shuffle=True, random_state=RANDOM_STATE)
-        x_fit, y_fit = train.loc[fit_rows, operating_cols], train.loc[fit_rows, sensor]
+        # Tree models do not accept missing values.  The main model path already
+        # imputes; doing the same here keeps optional twin diagnostics from
+        # making an otherwise scoreable batch fail.
+        imputer = SimpleImputer(strategy="median")
+        x_fit = imputer.fit_transform(train.loc[fit_rows, operating_cols])
+        x_test = imputer.transform(test[operating_cols])
+        y_fit = train.loc[fit_rows, sensor]
         oof = cross_val_predict(model, x_fit, y_fit, cv=folds, n_jobs=-1)
         residual = y_fit.to_numpy() - oof
         baseline = np.sum((y_fit.to_numpy() - y_fit.mean()) ** 2)
@@ -221,7 +290,7 @@ def sensor_twin_checks(train: pd.DataFrame, test: pd.DataFrame, is_valid: pd.Ser
         scale = max(np.median(np.abs(residual - np.median(residual))) * 1.4826, 1e-6)
         threshold = float(np.quantile(np.abs(residual - np.median(residual)) / scale, .99))
         model.fit(x_fit, y_fit)
-        z = np.abs(test[sensor] - model.predict(test[operating_cols])) / scale
+        z = np.abs(test[sensor] - model.predict(x_test)) / scale
         result[f"twin_residual_{sensor}"] = z
         channel_flags[sensor] = z.gt(threshold).fillna(False)
     if channel_flags:
@@ -231,11 +300,46 @@ def sensor_twin_checks(train: pd.DataFrame, test: pd.DataFrame, is_valid: pd.Ser
     return result
 
 
+def write_submission(out: pd.DataFrame, template_path: str, id_column: str | None, output_path: Path) -> None:
+    """Create a competition-ready file using the supplied sample's exact columns."""
+    template = pd.read_csv(template_path)
+    if id_column is None:
+        id_column = resolve_column(out, None, ID_ALIASES, "ID")
+    if id_column not in out:
+        raise ValueError(f"ID column '{id_column}' was not found in the test data")
+    if id_column not in template:
+        raise ValueError(f"Submission template does not contain ID column '{id_column}'")
+
+    submission = pd.DataFrame({id_column: out[id_column]})
+    for column in template.columns:
+        if column == id_column:
+            continue
+        normalised = normalise(column)
+        if normalised in {normalise(x) for x in REFERENCE_ALIASES} or "reference" in normalised:
+            submission[column] = out["predicted_reference_parameter"]
+        elif normalised in {normalise(x) for x in VALIDITY_ALIASES} or "valid" in normalised:
+            submission[column] = out["predicted_validity"]
+        else:
+            raise ValueError(
+                f"Cannot map template column '{column}'. Expected an ID, reference parameter, or validity label."
+            )
+    submission = submission.loc[:, template.columns]
+    submission.to_csv(output_path, index=False)
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--train", required=True); ap.add_argument("--test", required=True); ap.add_argument("--out", required=True)
-    ap.add_argument("--reference-column"); ap.add_argument("--validity-column"); ap.add_argument("--time-column"); ap.add_argument("--asset-column"); ap.add_argument("--rules")
+    ap = argparse.ArgumentParser(description="Score industrial test records and explain detected data-quality issues.")
+    ap.add_argument("--train", required=True, help="CSV containing features plus reference and validity targets.")
+    ap.add_argument("--test", required=True, help="CSV containing records to score.")
+    ap.add_argument("--out", required=True, help="Directory for scored data, diagnostics, and metadata.")
+    ap.add_argument("--reference-column", help="Override the reference-parameter target column name.")
+    ap.add_argument("--validity-column", help="Override the Valid/Invalid target column name.")
+    ap.add_argument("--time-column", help="Ordered timestamp/cycle column for rate and frozen-sensor checks.")
+    ap.add_argument("--asset-column", help="Asset identifier used to separate time-series rule checks.")
+    ap.add_argument("--rules", help="Path to approved engineering-rules JSON.")
     ap.add_argument("--export-submission", action="store_true", help="write a verified submission.csv using Sample.csv next to --test")
+    ap.add_argument("--submission-template", help="Sample submission CSV; writes a matching submission.csv.")
+    ap.add_argument("--id-column", help="ID column to preserve in submission.csv (auto-detected when omitted).")
     args = ap.parse_args()
     train, test = pd.read_csv(args.train), pd.read_csv(args.test)
     ref = resolve_column(train, args.reference_column, REFERENCE_ALIASES, "reference")
@@ -261,10 +365,14 @@ def main() -> None:
     # A regime is rare but coherent: multivariate anomaly without a physical inconsistency.
     gmm = GaussianMixture(n_components=min(3, len(x_normal)), random_state=RANDOM_STATE).fit(x_normal)
     regime = gmm.predict(x_test)
-    # Predict label separately from anomaly diagnosis.
-    validity_model = ExtraTreesClassifier(n_estimators=400, min_samples_leaf=2, class_weight="balanced", random_state=RANDOM_STATE, n_jobs=-1)
-    validity_model.fit(x_train, train[validity].astype(str))
-    valid_prediction = validity_model.predict(x_test)
+    # Predict label separately from anomaly diagnosis. Sensor-consistency
+    # features are deliberately used only here: they improve QA detection but
+    # did not improve reference-parameter validation error.
+    validity_train = add_validity_features(train, features)
+    validity_test = add_validity_features(test, features)
+    validity_model, valid_prediction, invalid_probability, invalid_threshold, validity_validation = fit_validity_model(
+        validity_train, validity_test, train[validity]
+    )
     # Severity ordering preserves the actionable root cause. A model-only invalid
     # record is an invalid operating condition, not evidence of a sensor failure.
     reasons = np.where(statistical, "genuine_new_regime", "normal").astype(object)
@@ -283,6 +391,8 @@ def main() -> None:
     out = test.copy()
     out["predicted_reference_parameter"] = ref_model.predict(x_test)
     out["predicted_validity"] = valid_prediction
+    out["invalid_probability"] = invalid_probability
+    out["validity_confidence"] = np.where(valid_mask(pd.Series(valid_prediction)).to_numpy(), 1 - invalid_probability, invalid_probability)
     out["diagnosis"] = reasons
     out["operating_regime"] = regime
     out["isolation_score"] = iso_score; out["twin_reconstruction_error"] = reconstruction; out["robust_mahalanobis"] = mahal
@@ -292,13 +402,17 @@ def main() -> None:
     out.to_csv(out_dir / "scored_test.csv", index=False)
     if args.export_submission:
         export_submission(out, Path(args.test).with_name("Sample.csv"), out_dir / "submission.csv")
+    if args.submission_template:
+        write_submission(out, args.submission_template, args.id_column, out_dir / "submission.csv")
     (out_dir / "metrics_baseline.json").write_text(json.dumps(baseline_metrics(train, features, ref, validity), indent=2))
     (out_dir / "rule_config.json").write_text(json.dumps(rules, indent=2))
     diagnosis_counts = {key: int((out["diagnosis"] == key).sum()) for key in ("normal", "sensor_error", "corrupted_record", "invalid_condition", "genuine_new_regime")}
     summary = {"rows": int(len(out)), "diagnosis_counts": diagnosis_counts,
                "predicted_validity_counts": {str(k): int(v) for k, v in out["predicted_validity"].value_counts().items()},
                "features": features, "reference_column": ref, "validity_column": validity,
-               "models": {"reference": type(ref_model).__name__, "validity": type(validity_model).__name__, "anomaly": ["IsolationForest", "PCA surrogate reconstruction", "robust Mahalanobis", "GaussianMixture"]}}
+               "models": {"reference": type(ref_model).__name__, "validity": type(validity_model.named_steps["model"]).__name__, "anomaly": ["IsolationForest", "PCA surrogate reconstruction", "robust Mahalanobis", "GaussianMixture"]},
+               "validity_model": {"invalid_threshold": round(invalid_threshold, 4), "features": list(validity_train.columns), **validity_validation},
+               "artifacts": ["scored_test.csv", "rule_config.json", "summary.json"] + (["submission.csv"] if args.submission_template else [])}
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
 
 
